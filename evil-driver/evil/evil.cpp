@@ -95,6 +95,9 @@ WINDOWS_INDEX getWindowsIndex()
 	case 19041:
 		return WindowsIndexWIN10_2004;
 		break;
+	case 19042:
+		return WindowsIndexWIN10_20H2;
+		break;
 	default:
 		return WindowsIndexUNSUPPORTED;
 	}
